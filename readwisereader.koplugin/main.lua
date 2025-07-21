@@ -825,10 +825,15 @@ function ReadwiseReader:updateAvailableTags(documents)
             logger.dbg("ReadwiseReader:updateAvailableTags: no tags found for document", doc.id)
         end
         
-        logger.dbg("ReadwiseReader:updateAvailableTags: document", doc.id, "has", #self.document_tags[doc.id], "tags:", table.concat(self.document_tags[doc.id], ", "))
+        logger.dbg("ReadwiseReader:updateAvailableTags: document", doc.id, "has", #self.document_tags[doc.id], "tags")
     end
     
     table.sort(new_tags, function(a, b)
+        -- Ensure both values are strings before comparison
+        if type(a) ~= "string" or type(b) ~= "string" then
+            return false
+        end
+        
         local a_is_category = self:isDocumentCategory(a)
         local b_is_category = self:isDocumentCategory(b)
         
