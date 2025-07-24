@@ -791,7 +791,7 @@ function ReadwiseReader:updateAvailableTags(documents)
             end
         end
         
-        if doc.category then
+        if doc.category and type(doc.category) == "string" and doc.category ~= "" then
             local category_tag = doc.category
             logger.dbg("ReadwiseReader:updateAvailableTags: found category tag:", category_tag)
             
