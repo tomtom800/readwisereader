@@ -1129,16 +1129,17 @@ function ReadwiseReader:getDocumentList()
             logger.dbg("ReadwiseReader:getDocumentList: fetching documents from location:", location)
             next_cursor = nil
             local page_count = 0
+            local limit_reached = false
 
             repeat
                 page_count = page_count + 1
 
                 -- Update progress message with location and count
                 local location_display = location == "new" and "Inbox" or (location:sub(1,1):upper() .. location:sub(2))
-                self:showProgress(string.format("Getting %s articles (%d found)…", location_display, #documents))
+                self:showProgress(string.format("Getting %s articles (%d kept)…", location_display, #documents))
 
-                -- Fetch metadata only for fast tag discovery and filtering
-                local endpoint = "/list/?location=" .. location
+                -- Fetch with HTML content and tags for batch processing
+                local endpoint = "/list/?location=" .. location .. "&withHtmlContent=true&withTags=true"
                 if next_cursor and type(next_cursor) == "string" and next_cursor ~= "" then
                     endpoint = endpoint .. "&pageCursor=" .. next_cursor
                 end
@@ -1153,7 +1154,17 @@ function ReadwiseReader:getDocumentList()
                 if result.results then
                     for _, doc in ipairs(result.results) do
                         if doc.reading_progress < 1 then
-                            table.insert(documents, doc)
+                            -- Apply tag/location filtering during collection
+                            if not self:shouldSkipDocument(doc) then
+                                table.insert(documents, doc)
+
+                                -- Check if limit reached
+                                if self.max_articles_to_download > 0 and
+                                   #documents >= self.max_articles_to_download then
+                                    limit_reached = true
+                                    break
+                                end
+                            end
                         end
                     end
                 end
@@ -1165,39 +1176,12 @@ function ReadwiseReader:getDocumentList()
                 end
 
                 logger.dbg("ReadwiseReader:getDocumentList: processed page", page_count, "for location", location, ", next_cursor:", next_cursor)
-            until not next_cursor
+            until not next_cursor or limit_reached
         end
     end
     
     logger.dbg("ReadwiseReader:getDocumentList: total documents retrieved:", #documents)
     return documents
-end
-
-function ReadwiseReader:fetchDocumentHtml(document_id)
-    -- Fetch a single document with HTML content by ID
-    logger.dbg("ReadwiseReader:fetchDocumentHtml: fetching HTML for document", document_id)
-
-    local endpoint = "/list/?id=" .. document_id .. "&withHtmlContent=true"
-    local result, err = self:callAPI("GET", endpoint)
-
-    if not result then
-        logger.err("ReadwiseReader:fetchDocumentHtml: error fetching document", document_id, ":", err)
-        return nil
-    end
-
-    if result.results and #result.results > 0 then
-        local doc = result.results[1]
-        if doc.html_content then
-            logger.dbg("ReadwiseReader:fetchDocumentHtml: successfully fetched HTML for", document_id, "length:", #doc.html_content)
-            return doc.html_content
-        else
-            logger.warn("ReadwiseReader:fetchDocumentHtml: no html_content in response for", document_id)
-            return nil
-        end
-    else
-        logger.err("ReadwiseReader:fetchDocumentHtml: no results returned for document", document_id)
-        return nil
-    end
 end
 
 function ReadwiseReader:getArchivedDocuments(since_date)
@@ -1313,16 +1297,11 @@ function ReadwiseReader:downloadDocument(document)
     -- Store author metadata from the API
     self:storeAuthorMetadata(document.id, document.author)
 
-    -- Fetch HTML content if not already present
+    -- Get HTML content (already fetched in getDocumentList)
     local content = document.html_content
-    
-    if not content or content == "" or type(content) ~= "string" then
-        logger.dbg("ReadwiseReader:downloadDocument: html_content not in document object, fetching for", document.id)
-        content = self:fetchDocumentHtml(document.id)
-    end
 
     if not content or content == "" or type(content) ~= "string" then
-        logger.warn("ReadwiseReader:downloadDocument: no HTML content available for", document.id, "after fetch attempt")
+        logger.warn("ReadwiseReader:downloadDocument: no HTML content available for", document.id)
 
         local basic_content = string.format([[
 <h1>%s</h1>
@@ -1854,9 +1833,17 @@ function ReadwiseReader:synchronize()
     local highlights_exported = 0
     if self.export_highlights_at_sync then
         self:showProgress("Exporting highlights to Readwise...")
-        local clippings = self:parseAllBooks()
-        if next(clippings) ~= nil then
-            highlights_exported, _ = self:exportToReadwise(clippings)
+        local success, clippings = pcall(function() return self:parseAllBooks() end)
+        if success then
+            if next(clippings) ~= nil then
+                highlights_exported, _ = self:exportToReadwise(clippings)
+            end
+        else
+            logger.warn("ReadwiseReader:synchronize: error parsing books for highlights:", clippings)
+            UIManager:show(InfoMessage:new{
+                text = "Note: Highlight export failed, but continuing with article sync.",
+                timeout = 3
+            })
         end
         self:hideProgress()
     end
@@ -1878,41 +1865,22 @@ function ReadwiseReader:synchronize()
     end
     
     self:updateAvailableTags(documents)
-    
+
     local filtered_documents = {}
-    local excluded_count = 0
     local existing_count = 0
-    
+
     for _, document in ipairs(documents) do
-        if self:shouldSkipDocument(document) then
-            excluded_count = excluded_count + 1
-        elseif self:documentExists(document.id) then
+        if self:documentExists(document.id) then
             existing_count = existing_count + 1
         else
             table.insert(filtered_documents, document)
         end
     end
 
-    -- Apply article limit if set (no sorting, relies on API order)
-    local limit_applied = false
-    if self.max_articles_to_download > 0 and #filtered_documents > self.max_articles_to_download then
-        local original_count = #filtered_documents
-        local limited = {}
-        for i = 1, self.max_articles_to_download do
-            limited[i] = filtered_documents[i]
-        end
-        filtered_documents = limited
-        limit_applied = true
-        logger.dbg("ReadwiseReader:synchronize: limited from", original_count, "to", self.max_articles_to_download, "articles")
-    end
-
     if #filtered_documents == 0 and cleaned_count == 0 and archived_count == 0 and highlights_exported == 0 then
         local msg = "No new articles found and no changes to process."
         if existing_count > 0 then
             msg = msg .. "\n" .. string.format("Skipped %d existing articles.", existing_count)
-        end
-        if excluded_count > 0 then
-            msg = msg .. "\n" .. string.format("Excluded %d articles due to tags/locations.", excluded_count)
         end
         UIManager:show(InfoMessage:new{ text = msg })
         
@@ -1964,14 +1932,6 @@ function ReadwiseReader:synchronize()
     
     if failed > 0 then
         msg = msg .. "\n" .. string.format("Failed: %d", failed)
-    end
-    
-    if excluded_count > 0 then
-        msg = msg .. "\n" .. string.format("Excluded due to tags/locations: %d", excluded_count)
-    end
-
-    if limit_applied then
-        msg = msg .. "\n" .. string.format("Limited to first: %d", self.max_articles_to_download)
     end
 
     if cleaned_count > 0 then
