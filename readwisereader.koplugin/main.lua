@@ -3,7 +3,7 @@
 -- ===============================================================================
 -- This plugin synchronizes articles from Readwise Reader to KOReader and
 -- exports highlights/notes back to Readwise
--- 
+--
 -- MAIN FEATURES:
 -- - Downloads articles from Readwise Reader "later" and "shortlist" locations
 -- - Converts articles to HTML format with embedded images
@@ -14,6 +14,7 @@
 -- - Fixed author metadata handling for proper highlight export
 -- - Enhanced URL corruption detection and repair for all image sources
 -- - Simple adaptive rate limiting to prevent API errors
+-- - Configurable article download limit to control sync size
 -- ===============================================================================
 
 local BD = require("ui/bidi")
@@ -61,10 +62,10 @@ local ReadwiseReader = WidgetContainer:extend{
 }
 
 function ReadwiseReader:onDispatcherRegisterActions()
-    Dispatcher:registerAction("readwisereader_download", { 
-        category = "none", 
-        event = "SynchronizeReadwiseReader", 
-        title = "Readwise Reader sync", 
+    Dispatcher:registerAction("readwisereader_download", {
+        category = "none",
+        event = "SynchronizeReadwiseReader",
+        title = "Readwise Reader sync",
         general = true,
     })
 end
@@ -97,13 +98,16 @@ function ReadwiseReader:init()
     self.download_images = settings.download_images == nil and true or settings.download_images
     self.max_image_size_mb = settings.max_image_size_mb or 10
 
+    -- Initialize max articles download limit
+    self.max_articles_to_download = settings.max_articles_to_download or 0 -- 0 = unlimited
+
     -- Simple rate limiting state
     self.api_call_count = 0
     self.sync_start_time = nil
     self.needs_rate_limiting = false
 
     -- Initialize highlights parser
-    self.parser = MyClipping:new{ ui = self.ui }
+    self.parser = MyClipping:new{}
     
     self.ui.menu:registerToMainMenu(self)
 end
@@ -463,16 +467,25 @@ function ReadwiseReader:addToMainMenu(menu_items)
                         }
                     },
                     {
+                        text_func = function()
+                            if self.max_articles_to_download == 0 then
+                                return "Max articles per sync: Unlimited"
+                            else
+                                return string.format("Max articles per sync: %d", self.max_articles_to_download)
+                            end
+                        end,
+                        keep_menu_open = true,
+                        callback = function()
+                            self:showMaxArticlesDialog()
+                        end,
+                    },
+                    {
                         text = "Exclude from sync",
                         sub_item_table_func = function()
                             return self:getExclusionMenuItems()
                         end,
                     },
                 }
-            },
-            {
-                text = "Version 1.5",
-                enabled = false,
             },
         },
     }
@@ -1002,6 +1015,27 @@ function ReadwiseReader:showImageSizeDialog()
     UIManager:show(spin)
 end
 
+function ReadwiseReader:showMaxArticlesDialog()
+    local SpinWidget = require("ui/widget/spinwidget")
+    local UIManager = require("ui/uimanager")
+
+    local spin = SpinWidget:new{
+        value = self.max_articles_to_download,
+        value_min = 0,
+        value_max = 500,
+        value_step = 5,
+        value_hold_step = 25,
+        title_text = "Max Articles Per Sync",
+        info_text = "0 = unlimited\n\nDownloads first X articles from API.\nExisting local articles are skipped first.",
+        ok_text = _("Save"),
+        callback = function(spin_widget)
+            self.max_articles_to_download = spin_widget.value
+            self:saveSettings()
+        end,
+    }
+    UIManager:show(spin)
+end
+
 function ReadwiseReader:callAPI(method, endpoint, body, quiet)
     quiet = quiet or false
     local headers = {
@@ -1094,9 +1128,17 @@ function ReadwiseReader:getDocumentList()
         else
             logger.dbg("ReadwiseReader:getDocumentList: fetching documents from location:", location)
             next_cursor = nil
-            
+            local page_count = 0
+
             repeat
-                local endpoint = "/list/?location=" .. location .. "&withHtmlContent=true&withTags=true"
+                page_count = page_count + 1
+
+                -- Update progress message with location and count
+                local location_display = location == "new" and "Inbox" or (location:sub(1,1):upper() .. location:sub(2))
+                self:showProgress(string.format("Getting %s articles (%d found)…", location_display, #documents))
+
+                -- Fetch metadata only for fast tag discovery and filtering
+                local endpoint = "/list/?location=" .. location
                 if next_cursor and type(next_cursor) == "string" and next_cursor ~= "" then
                     endpoint = endpoint .. "&pageCursor=" .. next_cursor
                 end
@@ -1121,14 +1163,41 @@ function ReadwiseReader:getDocumentList()
                 else
                     next_cursor = nil
                 end
-                
-                logger.dbg("ReadwiseReader:getDocumentList: processed page for location", location, ", next_cursor:", next_cursor)
+
+                logger.dbg("ReadwiseReader:getDocumentList: processed page", page_count, "for location", location, ", next_cursor:", next_cursor)
             until not next_cursor
         end
     end
     
     logger.dbg("ReadwiseReader:getDocumentList: total documents retrieved:", #documents)
     return documents
+end
+
+function ReadwiseReader:fetchDocumentHtml(document_id)
+    -- Fetch a single document with HTML content by ID
+    logger.dbg("ReadwiseReader:fetchDocumentHtml: fetching HTML for document", document_id)
+
+    local endpoint = "/list/?id=" .. document_id .. "&withHtmlContent=true"
+    local result, err = self:callAPI("GET", endpoint)
+
+    if not result then
+        logger.err("ReadwiseReader:fetchDocumentHtml: error fetching document", document_id, ":", err)
+        return nil
+    end
+
+    if result.results and #result.results > 0 then
+        local doc = result.results[1]
+        if doc.html_content then
+            logger.dbg("ReadwiseReader:fetchDocumentHtml: successfully fetched HTML for", document_id, "length:", #doc.html_content)
+            return doc.html_content
+        else
+            logger.warn("ReadwiseReader:fetchDocumentHtml: no html_content in response for", document_id)
+            return nil
+        end
+    else
+        logger.err("ReadwiseReader:fetchDocumentHtml: no results returned for document", document_id)
+        return nil
+    end
 end
 
 function ReadwiseReader:getArchivedDocuments(since_date)
@@ -1243,12 +1312,18 @@ function ReadwiseReader:downloadDocument(document)
     
     -- Store author metadata from the API
     self:storeAuthorMetadata(document.id, document.author)
-    
+
+    -- Fetch HTML content if not already present
     local content = document.html_content
     
     if not content or content == "" or type(content) ~= "string" then
-        logger.warn("ReadwiseReader:downloadDocument: no HTML content available for", document.id)
-        
+        logger.dbg("ReadwiseReader:downloadDocument: html_content not in document object, fetching for", document.id)
+        content = self:fetchDocumentHtml(document.id)
+    end
+
+    if not content or content == "" or type(content) ~= "string" then
+        logger.warn("ReadwiseReader:downloadDocument: no HTML content available for", document.id, "after fetch attempt")
+
         local basic_content = string.format([[
 <h1>%s</h1>
 <p><strong>Author:</strong> %s</p>
@@ -1817,7 +1892,20 @@ function ReadwiseReader:synchronize()
             table.insert(filtered_documents, document)
         end
     end
-    
+
+    -- Apply article limit if set (no sorting, relies on API order)
+    local limit_applied = false
+    if self.max_articles_to_download > 0 and #filtered_documents > self.max_articles_to_download then
+        local original_count = #filtered_documents
+        local limited = {}
+        for i = 1, self.max_articles_to_download do
+            limited[i] = filtered_documents[i]
+        end
+        filtered_documents = limited
+        limit_applied = true
+        logger.dbg("ReadwiseReader:synchronize: limited from", original_count, "to", self.max_articles_to_download, "articles")
+    end
+
     if #filtered_documents == 0 and cleaned_count == 0 and archived_count == 0 and highlights_exported == 0 then
         local msg = "No new articles found and no changes to process."
         if existing_count > 0 then
@@ -1881,7 +1969,11 @@ function ReadwiseReader:synchronize()
     if excluded_count > 0 then
         msg = msg .. "\n" .. string.format("Excluded due to tags/locations: %d", excluded_count)
     end
-    
+
+    if limit_applied then
+        msg = msg .. "\n" .. string.format("Limited to first: %d", self.max_articles_to_download)
+    end
+
     if cleaned_count > 0 then
         msg = msg .. "\n" .. string.format("Cleaned up archived: %d", cleaned_count)
     end
@@ -1926,6 +2018,7 @@ function ReadwiseReader:saveSettings()
         document_authors = self.document_authors,
         download_images = self.download_images,
         max_image_size_mb = self.max_image_size_mb,
+        max_articles_to_download = self.max_articles_to_download,
     }
     self.readwise_settings:saveSetting("readwisereader", settings)
     self.readwise_settings:flush()
