@@ -487,6 +487,10 @@ function ReadwiseReader:addToMainMenu(menu_items)
                     },
                 }
             },
+            {
+                text = "Version 1.7",
+                enabled = false,
+            },
         },
     }
 end
