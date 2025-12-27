@@ -1361,6 +1361,11 @@ function ReadwiseReader:processHtmlContent(content, document)
     local max_article_size = self.max_image_size_mb * 1024 * 1024
     local images_stopped = false
     
+    if total_article_size > max_article_size then
+        images_stopped = true
+        logger.dbg("ReadwiseReader:processHtmlContent: text content already exceeds size limit, skipping all image downloads")
+    end
+
     local html = string.format([[
 <!DOCTYPE html>
 <html>
