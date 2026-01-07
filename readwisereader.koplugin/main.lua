@@ -1295,22 +1295,14 @@ function ReadwiseReader:reconcileLocalDocuments(server_documents)
     local removed_count = 0
 
     -- Scan local directory for Readwise articles
-    for entry in lfs.dir(self.directory) do
-        if entry ~= "." and entry ~= ".." then
-            local filepath = self.directory .. entry
-
-            if lfs.attributes(filepath, "mode") == "file" and entry:find(article_id_prefix, 1, true) then
-                local doc_id = self:getDocumentIdFromPath(filepath)
-
-                if doc_id and not server_ids[doc_id] then
-                    logger.dbg("ReadwiseReader:reconcileLocalDocuments: removing", filepath, "- no longer matches server state")
-                    FileManager:deleteFile(filepath, true)
-                    self:removeAuthorMetadata(doc_id)
-                    removed_count = removed_count + 1
-                end
-            end
+    self:forEachLocalDocument(function(doc_id, filepath)
+        if not server_ids[doc_id] then
+            logger.dbg("ReadwiseReader:reconcileLocalDocuments: removing", filepath, "- no longer matches server state")
+            FileManager:deleteFile(filepath, true)
+            self:removeAuthorMetadata(doc_id)
+            removed_count = removed_count + 1
         end
-    end
+    end)
 
     logger.dbg("ReadwiseReader:reconcileLocalDocuments: removed", removed_count, "articles no longer on server")
     return removed_count
