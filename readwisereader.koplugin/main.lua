@@ -8,6 +8,7 @@
 -- - Downloads articles from Readwise Reader "later" and "shortlist" locations
 -- - Converts articles to HTML format with embedded images
 -- - Generates KOReader metadata sidecars (.sdr) for enhanced library integration
+-- - Automatically manages KOReader collections based on article location
 -- - Offers filtering by article tags, location and type
 -- - Archives finished articles back to Readwise
 -- - Exports highlights and notes to Readwise
@@ -30,6 +31,7 @@ local InputDialog = require("ui/widget/inputdialog")
 local JSON = require("json")
 local LuaSettings = require("luasettings")
 local MultiConfirmBox = require("ui/widget/multiconfirmbox")
+local ReadCollection = require("readcollection")
 local MyClipping = require("clip")
 local NetworkMgr = require("ui/network/manager")
 local ReadHistory = require("readhistory")
@@ -254,6 +256,132 @@ function ReadwiseReader:setDocumentMetadata(filepath, document)
     else
         logger.warn("ReadwiseReader:setDocumentMetadata: failed to write custom metadata for", filepath)
     end
+end
+
+-- ===============================================================================
+-- COLLECTION MANAGEMENT
+-- ===============================================================================
+
+function ReadwiseReader:getDisplayNameForLocation(location)
+    if not location then
+        return nil
+    end
+
+    local mapping = {
+        new = "Inbox",
+    }
+
+    if mapping[location] then
+        return mapping[location]
+    end
+
+    -- Fallback: capitalize first letter
+    return location:sub(1, 1):upper() .. location:sub(2)
+end
+
+function ReadwiseReader:getCollectionNameForLocation(location)
+    local location_display = self:getDisplayNameForLocation(location)
+    if not location_display then
+        return nil
+    end
+
+    return "Readwise: " .. location_display
+end
+
+function ReadwiseReader:initCollectionTracking()
+    self.modified_collections = {}
+end
+
+function ReadwiseReader:saveCollections()
+    if next(self.modified_collections) then
+        local count = 0
+        for _ in pairs(self.modified_collections) do count = count + 1 end
+        logger.dbg("ReadwiseReader:saveCollections: saving", count, "modified collections")
+        ReadCollection:write(self.modified_collections)
+        self.modified_collections = {}
+    end
+end
+
+function ReadwiseReader:ensureCollectionExists(location)
+    if not location then
+        return false
+    end
+
+    local collection_name = self:getCollectionNameForLocation(location)
+
+    if not ReadCollection.coll[collection_name] then
+        logger.dbg("ReadwiseReader:ensureCollectionExists: creating collection", collection_name)
+        ReadCollection:addCollection(collection_name)
+        return true
+    end
+
+    return false
+end
+
+function ReadwiseReader:removeFromAllCollections(filepath)
+    if not filepath then
+        return
+    end
+
+    local collections = ReadCollection:getCollectionsWithFile(filepath)
+    if collections then
+        for coll_name, _ in pairs(collections) do
+            if coll_name:match("^Readwise: ") then
+                logger.dbg("ReadwiseReader:removeFromAllCollections: removing", filepath, "from", coll_name)
+                ReadCollection:removeItem(filepath, coll_name, true)
+                self.modified_collections[coll_name] = true
+            end
+        end
+    end
+end
+
+function ReadwiseReader:updateDocumentCollections(filepath, document)
+    if not filepath or not document then
+        logger.dbg("ReadwiseReader:updateDocumentCollections: missing filepath or document")
+        return false
+    end
+
+    local new_location = document.location
+
+    if not new_location then
+        logger.dbg("ReadwiseReader:updateDocumentCollections: no location for document", document.id)
+        return false
+    end
+
+    self:ensureCollectionExists(new_location)
+
+    local new_collection = self:getCollectionNameForLocation(new_location)
+
+    if not new_collection then
+        return false
+    end
+
+    local all_readwise_collections = {}
+    if self.available_locations then
+        for _, location in ipairs(self.available_locations) do
+            local coll_name = self:getCollectionNameForLocation(location)
+            if ReadCollection.coll[coll_name] and ReadCollection:isFileInCollection(filepath, coll_name) then
+                table.insert(all_readwise_collections, coll_name)
+            end
+        end
+    end
+
+    for _, old_collection in ipairs(all_readwise_collections) do
+        if old_collection ~= new_collection then
+            ReadCollection:removeItem(filepath, old_collection, true)
+            self.modified_collections[old_collection] = true
+        end
+    end
+
+    local is_in_collection = ReadCollection.coll[new_collection] and ReadCollection:isFileInCollection(filepath, new_collection)
+
+    if not is_in_collection then
+        ReadCollection:addItem(filepath, new_collection)
+        self.modified_collections[new_collection] = true
+        return true
+    end
+
+    return false
 end
 
 -- ===============================================================================
@@ -568,12 +696,7 @@ function ReadwiseReader:getExclusionMenuItems()
         })
         
         for _, location in ipairs(self.available_locations) do
-            local display_location
-            if location == "new" then
-                display_location = "Inbox"
-            else
-                display_location = location:sub(1,1):upper() .. location:sub(2)
-            end
+            local display_location = self:getDisplayNameForLocation(location)
             
             table.insert(menu_items, {
                 text = display_location,
@@ -701,15 +824,19 @@ function ReadwiseReader:toggleLocationExclusion(location)
 end
 
 function ReadwiseReader:deleteArticlesWithLocation(location)
+    self:initCollectionTracking()
     local deleted_count = 0
     
     self:forEachLocalDocument(function(doc_id, filepath)
         if self:documentHasLocation(doc_id, location) then
             logger.dbg("ReadwiseReader:deleteArticlesWithLocation: deleting", filepath, "with location", location)
+            self:removeFromAllCollections(filepath)
             FileManager:deleteFile(filepath, true)
             deleted_count = deleted_count + 1
         end
     end)
+    
+    self:saveCollections()
     
     if deleted_count > 0 then
         UIManager:show(InfoMessage:new{
@@ -760,15 +887,19 @@ function ReadwiseReader:toggleTagExclusion(tag)
 end
 
 function ReadwiseReader:deleteArticlesWithTag(tag)
+    self:initCollectionTracking()
     local deleted_count = 0
     
     self:forEachLocalDocument(function(doc_id, filepath)
         if self:documentHasTag(doc_id, tag) then
             logger.dbg("ReadwiseReader:deleteArticlesWithTag: deleting", filepath, "with tag", tag)
+            self:removeFromAllCollections(filepath)
             FileManager:deleteFile(filepath, true)
             deleted_count = deleted_count + 1
         end
     end)
+    
+    self:saveCollections()
     
     if deleted_count > 0 then
         UIManager:show(InfoMessage:new{
@@ -1203,7 +1334,7 @@ function ReadwiseReader:getDocumentList()
                 page_count = page_count + 1
 
                 -- Update progress message with location and count
-                local location_display = location == "new" and "Inbox" or (location:sub(1,1):upper() .. location:sub(2))
+                local location_display = self:getDisplayNameForLocation(location)
                 self:showProgress(string.format("Getting %s articles (%d kept)…", location_display, #documents))
 
                 -- Fetch with HTML content and tags for batch processing
@@ -1340,6 +1471,7 @@ function ReadwiseReader:cleanupArchivedDocuments()
         
         if local_filepath then
             logger.dbg("ReadwiseReader:cleanupArchivedDocuments: deleting locally archived document", doc.id, local_filepath)
+            self:removeFromAllCollections(local_filepath)
             FileManager:deleteFile(local_filepath, true)
             -- Remove author metadata for archived documents
             self:removeAuthorMetadata(doc.id)
@@ -1367,6 +1499,7 @@ function ReadwiseReader:reconcileLocalDocuments(server_documents)
     self:forEachLocalDocument(function(doc_id, filepath)
         if not server_ids[doc_id] then
             logger.dbg("ReadwiseReader:reconcileLocalDocuments: removing", filepath, "- no longer matches server state")
+            self:removeFromAllCollections(filepath)
             FileManager:deleteFile(filepath, true)
             self:removeAuthorMetadata(doc_id)
             removed_count = removed_count + 1
@@ -1441,6 +1574,8 @@ function ReadwiseReader:downloadDocument(document)
         if not status then
             logger.warn("ReadwiseReader:downloadDocument: metadata writing failed:", err)
         end
+
+        self:updateDocumentCollections(filepath, document)
 
         return "downloaded"
     else
@@ -1908,6 +2043,7 @@ function ReadwiseReader:processFinishedDocuments()
             if status == "complete" then
                 if self:archiveDocument(doc_id) then
                     archived_count = archived_count + 1
+                    self:removeFromAllCollections(filepath)
                     FileManager:deleteFile(filepath, true)
                     deleted_count = deleted_count + 1
                 end
@@ -1933,6 +2069,8 @@ function ReadwiseReader:synchronize()
     self.api_call_count = 0
     self.sync_start_time = nil
     self.needs_rate_limiting = false
+
+    self:initCollectionTracking()
     
     local sync_start_time = os.date("!%Y-%m-%dT%H:%M:%SZ")
     
@@ -2018,6 +2156,8 @@ function ReadwiseReader:synchronize()
         end
     end
     
+    self:saveCollections()
+
     self:hideProgress()
     
     self.last_sync_time = sync_start_time
